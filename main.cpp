@@ -3,6 +3,82 @@
 HANDLE      theWin32ExitSignal;
 SKSystem    theSystem;
 
+void SKKernel_RecvIcis(SKCpu *apThisCpu)
+{
+    SKICI volatile *pIciList;
+    SKICI volatile *pTemp;
+    SKICI volatile *pHold;
+
+    do
+    {
+        pIciList = (SKICI volatile *)InterlockedExchangePointer((volatile PVOID *)&apThisCpu->mpPendingIcis, NULL);
+        if (NULL == pIciList)
+            break;
+
+        //
+        // reverse the list so the Icis are processed in the order they arrived
+        //
+        pHold = NULL;
+        do
+        {
+            pTemp = pIciList->mpNext;
+            pIciList->mpNext = pHold;
+            pHold = pIciList;
+            pIciList = pTemp;
+        } while (NULL != pIciList);
+        pIciList = pHold;
+
+        //
+        // now do the Ici in order
+        //
+        do
+        {
+            pHold = pIciList;
+            pIciList = pIciList->mpNext;
+
+            SKCpu_OnRecvIci(apThisCpu, pHold->mpSenderCpu, pHold->mCode);
+
+            free((void *)pHold);
+            
+        } while (NULL != pIciList);
+
+    } while (true);
+}
+
+void SKKernel_SendIci(SKCpu *apThisCpu, DWORD aTargetCpu, UINT_PTR aCode)
+{
+    SKSystem *pSys = apThisCpu->mpSystem;
+    
+    SKCpu *pTarget = &pSys->mpCpus[aTargetCpu];
+    
+    SKICI *pIci = (SKICI *)malloc(sizeof(SKICI));
+    if (NULL == pIci)
+    {
+        printf("Memory allocation failed generating Ici on cpu %d\n", apThisCpu->mCpuIndex);
+        ExitProcess(__LINE__);
+    }
+    
+    pIci->mCode = aCode;
+    pIci->mpSenderCpu = apThisCpu;
+
+    SKICI volatile *pLast;
+    SKICI volatile *pOld;
+    do
+    {
+        pLast = pTarget->mpPendingIcis;
+        _mm_lfence();
+        pIci->mpNext = pLast;
+        _mm_sfence();
+        pOld = (SKICI volatile *)InterlockedCompareExchangePointer((volatile PVOID *)&pTarget->mpPendingIcis, pIci, (PVOID)pLast);
+    } while (pOld != pLast);
+
+    if (((DWORD)-1) == SetEvent(pTarget->mhWin32ActionEvent))
+    {
+        printf("Could not fire action event for cpu %d from cpu %d\n", pTarget->mCpuIndex, apThisCpu->mCpuIndex);
+        ExitProcess(__LINE__);
+    }
+}
+
 DWORD WINAPI SKKernelThread(void *apParam)
 {
     SKCpu * pThisCpu = (SKCpu *)apParam;
@@ -46,8 +122,16 @@ DWORD WINAPI SKKernelThread(void *apParam)
 
         if (waitResult == WAIT_OBJECT_0)
         {
+            if (NULL != pThisCpu->mpPendingIcis)
+            {
+                //
+                // handle ICIs first
+                //
+                SKKernel_RecvIcis(pThisCpu);
+            }
+
             //
-            // logical interrupt not related to currently executing thread (IPI or IRQ)
+            // logical interrupt not related to currently executing thread (IRQ)
             //
             SKCpu_OnInterrupt(pThisCpu);
         }
@@ -111,6 +195,7 @@ SKInitCpu(
     pCpu = &apSystem->mpCpus[aCpuIndex];
     pCpu->mpSystem = apSystem;
     pCpu->mCpuIndex = aCpuIndex;
+    pCpu->mpPendingIcis = NULL;
     pCpu->mpIdleThread = pIdleThread = (SKThread *)malloc(sizeof(SKThread));
     if (NULL == pIdleThread)
     {
@@ -178,6 +263,9 @@ SKInitCpu(
 
     pCpu->mpCurrentThread = pCpu->mpIdleThread;
     pIdleThread->mpCurrentCpu = pCpu;
+
+    pCpu->mpPendingIcis = NULL;
+    _mm_sfence();
 
     if (((DWORD)-1) == ResumeThread(pCpu->mhWin32KernelThread))
     {

@@ -20,8 +20,9 @@ void SKCpu_OnShutdown(SKCpu *apThisCpu)
 void SKCpu_OnInterrupt(SKCpu *apThisCpu)
 {
     //
-    // entry to kernel that is not from the current thread
-    // so an IPI or an IRQ
+    // entry to kernel that is not from the current thread, so an IRQ
+    // change mpCurrentThread if you want some other thread to run
+    // when the function exits
     //
 
 }
@@ -35,3 +36,14 @@ void SKCpu_OnSystemCall(SKCpu *apThisCpu)
     //
 
 }
+
+void SKCpu_OnRecvIci(SKCpu *apThisCpu, SKCpu *apSenderCpu, UINT_PTR aCode)
+{
+    //
+    // we received an ICI from the sender Cpu with the corresponding code
+    // change mpCurrentThread if you want some other thread to run
+    // when the function exits
+    //
+
+}
+
