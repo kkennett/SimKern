@@ -18,9 +18,10 @@ struct _SKICI
 
 struct _SKThread
 {
-    HANDLE      mhWin32Thread;
-    DWORD       mWin32ThreadId;
-    SKCpu *     mpCurrentCpu;
+    HANDLE          mhWin32Thread;
+    DWORD           mWin32ThreadId;
+    SKCpu *         mpCurrentCpu;
+    LARGE_INTEGER   mRunTime;
 };
 
 struct _SKCpu
@@ -28,7 +29,8 @@ struct _SKCpu
     SKSystem *          mpSystem;
     DWORD               mCpuIndex;
 
-    HANDLE              mhWin32ActionEvent;
+    HANDLE              mhWin32IciEvent;
+    HANDLE              mhWin32IrqEvent;
     HANDLE              mhWin32SysCallEvent;
 
     HANDLE              mhWin32KernelThread;
@@ -37,6 +39,9 @@ struct _SKCpu
     SKThread *          mpCurrentThread;
 
     SKThread *          mpIdleThread;
+
+    LARGE_INTEGER       mSchedTimeout;
+    LARGE_INTEGER       mTimeNow;
 
     volatile SKICI *    mpPendingIcis;
 };
@@ -49,8 +54,9 @@ struct _SKSpinLock
 
 struct _SKSystem
 {
-    UINT_PTR    mCpuCount;
-    SKCpu      *mpCpus;
+    UINT_PTR        mCpuCount;
+    SKCpu      *    mpCpus;
+    LARGE_INTEGER   mPerfFreq;
 };
 
 extern HANDLE   theWin32ExitSignal;
@@ -61,11 +67,14 @@ void SKSpinLock_Lock(SKSpinLock *apLock);
 void SKSpinLock_Unlock(SKSpinLock *apLock);
 
 void SKKernel_SendIci(SKCpu *apThisCpu, DWORD aTargetCpu, UINT_PTR aCode);
+void SKKernel_MsToCpuTime(DWORD aMilliseconds, LARGE_INTEGER *apCpuTime);
+DWORD SKKernel_CpuTimeToMs(LARGE_INTEGER *apCpuTime);
 
 void SKCpu_OnStartup(SKCpu *apThisCpu);
 void SKCpu_OnShutdown(SKCpu *apThisCpu);
 void SKCpu_OnRecvIci(SKCpu *apThisCpu, SKCpu *apSenderCpu, UINT_PTR aCode);
-void SKCpu_OnInterrupt(SKCpu *apThisCpu);
+void SKCpu_OnIrqInterrupt(SKCpu *apThisCpu);
+void SKCpu_OnSchedTimerExpiry(SKCpu *apThisCpu);
 void SKCpu_OnSystemCall(SKCpu *apThisCpu);
 
 #endif // __SIMKERN_H

@@ -3,6 +3,16 @@
 HANDLE      theWin32ExitSignal;
 SKSystem    theSystem;
 
+void SKKernel_MsToCpuTime(DWORD aMilliseconds, LARGE_INTEGER *apCpuTime)
+{
+    apCpuTime->QuadPart = (((LONGLONG)aMilliseconds) * theSystem.mPerfFreq.QuadPart) / 1000ll;
+}
+
+DWORD SKKernel_CpuTimeToMs(LARGE_INTEGER *apCpuTime)
+{
+    return (DWORD)((apCpuTime->QuadPart * 1000ll) / theSystem.mPerfFreq.QuadPart);
+}
+
 void SKKernel_RecvIcis(SKCpu *apThisCpu)
 {
     SKICI volatile *pIciList;
@@ -72,7 +82,7 @@ void SKKernel_SendIci(SKCpu *apThisCpu, DWORD aTargetCpu, UINT_PTR aCode)
         pOld = (SKICI volatile *)InterlockedCompareExchangePointer((volatile PVOID *)&pTarget->mpPendingIcis, pIci, (PVOID)pLast);
     } while (pOld != pLast);
 
-    if (((DWORD)-1) == SetEvent(pTarget->mhWin32ActionEvent))
+    if (((DWORD)-1) == SetEvent(pTarget->mhWin32IciEvent))
     {
         printf("Could not fire action event for cpu %d from cpu %d\n", pTarget->mCpuIndex, apThisCpu->mCpuIndex);
         ExitProcess(__LINE__);
@@ -81,13 +91,19 @@ void SKKernel_SendIci(SKCpu *apThisCpu, DWORD aTargetCpu, UINT_PTR aCode)
 
 DWORD WINAPI SKKernelThread(void *apParam)
 {
-    SKCpu * pThisCpu = (SKCpu *)apParam;
-    DWORD   waitResult;
-    HANDLE  waitHandles[2];
+    SKCpu *         pThisCpu = (SKCpu *)apParam;
+    DWORD           lastWaitResult;
+    HANDLE          waitHandles[3];
+    DWORD           timeOutMs;
+    LARGE_INTEGER   timeLast;
+    LARGE_INTEGER   timeDelta;
+    LARGE_INTEGER * pTimeNow;
+    BOOL            schedTimerExpired;
+    BOOL            ranThread;
 
     SKCpu_OnStartup(pThisCpu);
 
-    if (FALSE == SetEvent(pThisCpu->mhWin32ActionEvent))
+    if (FALSE == SetEvent(pThisCpu->mhWin32IciEvent))
     {
         printf("Could not set start event for CPU %d\n", pThisCpu->mCpuIndex);
         ExitProcess(__LINE__);
@@ -96,31 +112,77 @@ DWORD WINAPI SKKernelThread(void *apParam)
     // 
     // idle thread is current thread, suspsended
     // 
-    if (((DWORD)-1) == ResumeThread(pThisCpu->mpIdleThread->mhWin32Thread))
-    {
-        printf("Could not resume idle thread at startup of CPU %d\n", pThisCpu->mCpuIndex);
-        ExitProcess(__LINE__);
-    }
 
-    waitHandles[0] = pThisCpu->mhWin32ActionEvent;
-    waitHandles[1] = pThisCpu->mhWin32SysCallEvent;
-    printf("CPU %d IDLE\n", pThisCpu->mCpuIndex);
+    waitHandles[0] = pThisCpu->mhWin32IciEvent;
+    waitHandles[1] = pThisCpu->mhWin32IrqEvent;
+    waitHandles[2] = pThisCpu->mhWin32SysCallEvent;
+    pTimeNow = &pThisCpu->mTimeNow;
+    QueryPerformanceCounter(pTimeNow);
+    timeLast = *pTimeNow;
+    lastWaitResult = WAIT_TIMEOUT;
     do
     {
-        waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+        lastWaitResult = WaitForMultipleObjects(3, waitHandles, FALSE, 0);
 
-        if (((DWORD)-1) == SuspendThread(pThisCpu->mpCurrentThread->mhWin32Thread))
+        ranThread = FALSE;
+        if (lastWaitResult == WAIT_TIMEOUT)
         {
-            printf("Could not suspend current thread on CPU %d\n", pThisCpu->mCpuIndex);
-            ExitProcess(__LINE__);
-        }
-        if (pThisCpu->mpCurrentThread == pThisCpu->mpIdleThread)
-        {
-            printf("CPU %d EXIT IDLE\n", pThisCpu->mCpuIndex);
-            ExitProcess(__LINE__);
+            // 
+            // nothing is going on. resume the current thread
+            //
+            if (pThisCpu->mpCurrentThread == pThisCpu->mpIdleThread)
+            {
+                printf("CPU %d ENTER IDLE\n", pThisCpu->mCpuIndex);
+            }
+            if (((DWORD)-1) == ResumeThread(pThisCpu->mpCurrentThread->mhWin32Thread))
+            {
+                printf("Could not resume current thread of CPU %d\n", pThisCpu->mCpuIndex);
+                ExitProcess(__LINE__);
+            }
+
+            ranThread = TRUE;
+            if (0 != pThisCpu->mSchedTimeout.QuadPart)
+                timeOutMs = SKKernel_CpuTimeToMs(&pThisCpu->mSchedTimeout);
+            else
+                timeOutMs = INFINITE;
+            lastWaitResult = WaitForMultipleObjects(3, waitHandles, FALSE, timeOutMs);
+
+            if (((DWORD)-1) == SuspendThread(pThisCpu->mpCurrentThread->mhWin32Thread))
+            {
+                printf("Could not suspend current thread on CPU %d\n", pThisCpu->mCpuIndex);
+                ExitProcess(__LINE__);
+            }
+            if (pThisCpu->mpCurrentThread == pThisCpu->mpIdleThread)
+            {
+                printf("CPU %d EXIT IDLE\n", pThisCpu->mCpuIndex);
+            }
         }
 
-        if (waitResult == WAIT_OBJECT_0)
+        QueryPerformanceCounter(pTimeNow);
+        timeDelta.QuadPart = pTimeNow->QuadPart - timeLast.QuadPart;
+        timeLast.QuadPart = pTimeNow->QuadPart;
+        if (ranThread)
+        {
+            pThisCpu->mpCurrentThread->mRunTime.QuadPart += timeDelta.QuadPart;
+        }
+        schedTimerExpired = FALSE;
+        if (0 != pThisCpu->mSchedTimeout.QuadPart)
+        {
+            //
+            // scheduling timer on this CPU is running
+            //
+            if (timeDelta.QuadPart > pThisCpu->mSchedTimeout.QuadPart)
+            {
+                pThisCpu->mSchedTimeout.QuadPart = 0;
+                schedTimerExpired = TRUE;
+            }
+            else
+            {
+                pThisCpu->mSchedTimeout.QuadPart -= timeDelta.QuadPart;
+            }
+        }
+
+        if (lastWaitResult == WAIT_OBJECT_0)
         {
             if (NULL != pThisCpu->mpPendingIcis)
             {
@@ -129,13 +191,15 @@ DWORD WINAPI SKKernelThread(void *apParam)
                 //
                 SKKernel_RecvIcis(pThisCpu);
             }
-
-            //
-            // logical interrupt not related to currently executing thread (IRQ)
-            //
-            SKCpu_OnInterrupt(pThisCpu);
         }
-        else if (waitResult == WAIT_OBJECT_0 + 1)
+        else if (lastWaitResult == WAIT_OBJECT_0 + 1)
+        {
+            //
+            // logical interrupt
+            //
+            SKCpu_OnIrqInterrupt(pThisCpu);
+        }
+        else if (lastWaitResult == WAIT_OBJECT_0 + 2)
         {
             // System Call from current thread
             if (pThisCpu->mpCurrentThread == pThisCpu->mpIdleThread)
@@ -143,28 +207,11 @@ DWORD WINAPI SKKernelThread(void *apParam)
                 printf("Idle thread did system call on CPU %d\n", pThisCpu->mCpuIndex);
                 ExitProcess(__LINE__);
             }
-
-            //
-            // take activity based on reason for current thread entering 'kernel'
-            //
             SKCpu_OnSystemCall(pThisCpu);
         }
-        else
-        {
-            printf("Failed to wait for action event on CPU %d\n", pThisCpu->mCpuIndex);
-            ExitProcess(__LINE__);
-        }
 
-        if (pThisCpu->mpCurrentThread == pThisCpu->mpIdleThread)
-        {
-            printf("CPU %d ENTER IDLE\n", pThisCpu->mCpuIndex);
-        }
-
-        if (((DWORD)-1) == ResumeThread(pThisCpu->mpCurrentThread->mhWin32Thread))
-        {
-            printf("Could not resume current thread of CPU %d\n", pThisCpu->mCpuIndex);
-            ExitProcess(__LINE__);
-        }
+        if (schedTimerExpired)
+            SKCpu_OnSchedTimerExpiry(pThisCpu);
 
     } while (true);
 
@@ -203,13 +250,18 @@ SKInitCpu(
         ExitProcess(__LINE__);
     }
 
-    pCpu->mhWin32ActionEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-    if (NULL == pCpu->mhWin32ActionEvent)
+    pCpu->mhWin32IciEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (NULL == pCpu->mhWin32IciEvent)
     {
-        printf("Could not create action event for CPU %d\n", aCpuIndex);
+        printf("Could not create Ici event for CPU %d\n", aCpuIndex);
         ExitProcess(__LINE__);
     }
-
+    pCpu->mhWin32IrqEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (NULL == pCpu->mhWin32IrqEvent)
+    {
+        printf("Could not create Irq event for CPU %d\n", aCpuIndex);
+        ExitProcess(__LINE__);
+    }
     pCpu->mhWin32SysCallEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     if (NULL == pCpu->mhWin32SysCallEvent)
     {
@@ -263,6 +315,9 @@ SKInitCpu(
 
     pCpu->mpCurrentThread = pCpu->mpIdleThread;
     pIdleThread->mpCurrentCpu = pCpu;
+    pIdleThread->mRunTime.QuadPart = 0;
+
+    pCpu->mSchedTimeout.QuadPart = 0;
 
     pCpu->mpPendingIcis = NULL;
     _mm_sfence();
@@ -272,7 +327,7 @@ SKInitCpu(
         printf("Could not resume kernel thread for CPU %d\n", aCpuIndex);
         ExitProcess(__LINE__);
     }
-    if (WAIT_OBJECT_0 != WaitForSingleObject(pCpu->mhWin32ActionEvent, INFINITE))
+    if (WAIT_OBJECT_0 != WaitForSingleObject(pCpu->mhWin32IciEvent, INFINITE))
     {
         printf("Waiting for kernel thread to start failed for CPU %d\n", aCpuIndex);
         ExitProcess(__LINE__);
@@ -301,6 +356,12 @@ void Startup(void)
         ExitProcess(__LINE__);
     }
 
+    if (FALSE == QueryPerformanceFrequency(&theSystem.mPerfFreq))
+    {
+        printf("failed to get core perf frequency\n");
+        ExitProcess(__LINE__);
+    }
+
     for (ix = 0; ix < theSystem.mCpuCount; ix++)
     {
         SKInitCpu(&theSystem, (DWORD)ix);
@@ -310,6 +371,7 @@ void Startup(void)
 void Run(void)
 {
     WaitForSingleObject(theWin32ExitSignal, INFINITE);
+    printf("Run exiting\n");
 }
 
 void Shutdown(void)
